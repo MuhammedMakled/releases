@@ -1,39 +1,104 @@
-name: Build JSON
+name: Build and Release IMAKER Endpoint Agent
 
 on:
   push:
-    branches:
-      - main
-  schedule:
-    # * is a special character in YAML so you have to quote this string
-    - cron:  '0 * * * *'
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-
+  test:
+    name: Run Vulnerability Check & Tests
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable' # يستخدم أحدث إصدار آمن خالي من ثغرة GO-2026-6617
+          check-latest: true
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run Vulnerability Check
+        run: govulncheck ./...
+
+      - name: Run Go Vet
+        run: GOOS=windows go vet ./...
+
+      - name: Run Unit Tests
+        run: go test -v ./...
+
+  build-and-release:
+    name: Build & Package Binaries
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: write
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install PyGithub
-    - name: Run script and commit changes
-      run: |
-        python release.py
-        echo "Setting up git credentials..."
-        git remote set-url origin https://x-access-token:"$GITHUB_TOKEN"@github.com/"$GITHUB_REPOSITORY".git
-        git config --global user.email "actions@github.com"
-        git config --global user.name "actions"
-        echo "Git credentials configured."
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-        git checkout main
-        git add .
-        git commit -m "Automatic update of data" && git push --set-upstream origin main || true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          check-latest: true
+
+      - name: Extract Tag Version
+        id: get_version
+        run: |
+          $TAG_NAME = "${{ github.ref_name }}"
+          $VERSION = $TAG_NAME -replace '^v', ''
+          echo "VERSION=$VERSION" >> $env:GITHUB_OUTPUT
+
+      - name: Build Binaries
+        run: |
+          $VERSION = "${{ steps.get_version.outputs.VERSION }}"
+          $LDFLAGS = "-s -w -X github.com/MuhammedMakled/iMaker-Group-Endpoint-Agent/internal/config.Version=$VERSION"
+          
+          $env:CGO_ENABLED = "0"
+          go build -trimpath -ldflags "$LDFLAGS -H=windowsgui" -o dist/ImakerTrayApp.exe ./cmd/agent
+          go build -trimpath -ldflags "$LDFLAGS" -o dist/ImakerAgentService.exe ./cmd/service
+
+      - name: Decode Code-Signing Certificate
+        shell: powershell
+        run: |
+          $pfxBytes = [System.Convert]::FromBase64String("${{ secrets.CODE_SIGNING_PFX_BASE64 }}")
+          [System.IO.File]::WriteAllBytes("cert.pfx", $pfxBytes)
+
+      - name: Sign Binaries (Authenticode)
+        shell: powershell
+        run: |
+          & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign /f cert.pfx /p "${{ secrets.CODE_SIGNING_PFX_PASSWORD }}" /tr http://timestamp.digicert.com /td sha256 /fd sha256 dist\ImakerAgentService.exe
+          & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign /f cert.pfx /p "${{ secrets.CODE_SIGNING_PFX_PASSWORD }}" /tr http://timestamp.digicert.com /td sha256 /fd sha256 dist\ImakerTrayApp.exe
+        continue-on-error: true # لمنع إيقاف الـ Release في حال وجود شهادة تجريبية محلياً
+
+      - name: Package Update Zip & Generate SHA256
+        shell: powershell
+        run: |
+          $VERSION = "${{ steps.get_version.outputs.VERSION }}"
+          $ZIP_NAME = "imaker-agent-$VERSION.zip"
+          Compress-Archive -Path dist\ImakerAgentService.exe, dist\ImakerTrayApp.exe -DestinationPath $ZIP_NAME
+          $HASH = (Get-FileHash -Path $ZIP_NAME -Algorithm SHA256).Hash.ToLower()
+          "$HASH  $ZIP_NAME" | Out-File -FilePath "$ZIP_NAME.sha256" -Encoding ascii
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            imaker-agent-*.zip
+            imaker-agent-*.zip.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
